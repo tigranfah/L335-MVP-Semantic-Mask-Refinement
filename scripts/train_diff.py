@@ -3,7 +3,8 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchmetrics import JaccardIndex, PeakSignalNoiseRatio
 import random
 from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
@@ -14,139 +15,101 @@ import wandb
 import random
 import string
 import argparse
+import glob
 
 
 def generate_random_id(length=6):
     return "".join(random.sample(string.ascii_lowercase + string.digits, k=length))
 
 
-def get_dataloader(image_size, batch_size, root_dir):
-    """Loads the Oxford-IIIT Pet dataset."""
+class CoarseOxfordIIITPet(Dataset):
+    """
+    A PyTorch Dataset that loads pre-generated tensor files from disk.
     
+    It assumes a directory structure created by 'pregenerate_dataset.py':
+    root_dir/
+    ├── images/
+    │   ├── 000000.pt
+    │   ├── 000001.pt
+    │   └── ...
+    ├── coarse_masks/
+    │   ├── 000000.pt
+    │   └── ...
+    └── gt_masks/
+        ├── 000000.pt
+        └── ...
+    """
+    def __init__(self, root_dir, image_transform=None, mask_transform=None, coarse_mask_transform=None):
+        self.root_dir = root_dir
+        self.image_transform = image_transform
+        self.mask_transform = mask_transform
+        self.coarse_mask_transform = coarse_mask_transform
+        
+        self.image_dir = os.path.join(root_dir, "images")
+        self.coarse_mask_dir = os.path.join(root_dir, "coarse_masks")
+        self.gt_mask_dir = os.path.join(root_dir, "gt_masks")
+        
+        # Get the list of file names (e.g., "000000.pt")
+        # We assume all directories are in sync
+        self.file_names = sorted(
+            [os.path.basename(f) for f in glob.glob(os.path.join(self.image_dir, "*.pt"))]
+        )
+        
+        if not self.file_names:
+            raise FileNotFoundError(f"No '.pt' files found in {self.image_dir}")
+
+    def __len__(self):
+        return len(self.file_names)
+
+    def __getitem__(self, idx):
+        file_name = self.file_names[idx]
+        
+        # Load the pre-saved tensors
+        image = torch.load(os.path.join(self.image_dir, file_name))
+        coarse_mask = torch.load(os.path.join(self.coarse_mask_dir, file_name))
+        gt_mask = torch.load(os.path.join(self.gt_mask_dir, file_name))
+        
+        # Apply any *additional* transforms (e.g., data augmentation)
+        # Note: Resizing/Normalization is already done!
+        if self.image_transform:
+            image = self.image_transform(image)
+        if self.mask_transform:
+            gt_mask = self.mask_transform(gt_mask)
+        if self.coarse_mask_transform:
+            coarse_mask = self.coarse_mask_transform(coarse_mask)
+            
+        return image, coarse_mask, gt_mask
+
+
+def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):    
     # Transforms for the RGB image
     image_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
+        lambda x: x.float(),
         # Normalize to [-1, 1]
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        transforms.Normalize((255 / 2, 255 / 2, 255 / 2), (255 / 2, 255 / 2, 255 / 2)),
     ])
     
     # Transforms for the segmentation mask
     mask_transform = transforms.Compose([
         transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.ToTensor(),
-        # The mask is 1, 2, 3. We want 0, 1, 2.
-        # Then, we'll just normalize [0, 2] to [-1, 1] for diffusion
-        lambda x: (x.float() - 1.0) / 1.0, # Maps [1, 3] -> [0, 2] -> [0, 2]... wait, let's rethink.
-        # Let's just scale [1, 3] to [-1, 1]
-        lambda x: (x.float() - 2.0) / 1.0 # Maps [1, 2, 3] -> [-1, 0, 1]
-        
-        # A simpler way: The mask is 1, 2, 3. Let's just normalize to [0, 1]
-        # and then to [-1, 1].
-        # lambda x: (x.float() - 1.0) / 2.0, # Maps [1, 2, 3] -> [0, 1, 2] -> [0, 0.5, 1]
-        # transforms.Normalize((0.5,), (0.5,)) # Maps [0, 1] -> [-1, 1]
-    ])
-
-    # --- Let's try the simplest mask transform ---
-    # ToTensor maps [1,2,3] (as PIL) to a [0,1,2] float tensor...
-    # No, it maps pixel values.
-    # Let's just normalize the 1-channel mask to [-1, 1]
-    mask_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.PILToTensor(), # This will scale 0-255 to [0, 1]. The mask is 1, 2, 3.
         # The mask values are 1 (pet), 2 (background), 3 (border).
         # We only care about the pet. Let's make a binary mask.
-        lambda x: (x == 1).float(), # 1 if pet, 0 if background/border
+        lambda x: ((x == 1) | (x == 3)).float(), # 1 if pet, 0 if background/border
+        transforms.Normalize((0.5,), (0.5,)) # Normalize [0, 1] to [-1, 1]
+    ])
+    coarse_mask_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
         transforms.Normalize((0.5,), (0.5,)) # Normalize [0, 1] to [-1, 1]
     ])
 
-    dataset = OxfordIIITPet(
-        root=root_dir, 
-        split="trainval", 
-        download=True, 
-        target_types="segmentation",
-        transform=image_transform,
-        target_transform=mask_transform
+    dataset = CoarseOxfordIIITPet(
+        root_dir,
+        image_transform=image_transform,
+        mask_transform=mask_transform,
+        coarse_mask_transform=coarse_mask_transform
     )
 
-    pet_class_name = "Abyssinian"
-    print(f"Filtering dataset for pet class: '{pet_class_name}'")
-    
-    # 1. Find the numerical index of the desired class
-    try:
-        # Note: Class names in the dataset are like 'Abyssinian', 'basset_hound'
-        class_idx = dataset.classes.index(pet_class_name)
-    except ValueError:
-        print(f"Error: Pet class '{pet_class_name}' not found.")
-        print(f"Available classes are: {dataset.classes}")
-        return None # Return None to indicate failure
-        
-    # 2. Get the indices of all samples matching this class index
-    #    The dataset object stores the class label for each image in ._labels
-    indices = [i for i, label in enumerate(dataset._labels) if label == class_idx]
-    
-    if not indices:
-        print(f"No samples found for class: {pet_class_name}")
-        return None
-        
-    print(f"Found {len(indices)} samples for class '{pet_class_name}'.")
-    
-    # 3. Create a Subset dataset using these indices
-    dataset = Subset(dataset, indices)
-    
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
-    print(dataloader)
-    return dataloader
-
-
-def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
-    """Loads the Oxford-IIIT Pet dataset and splits it into train and validation sets."""
-    
-    # Transforms for the RGB image
-    image_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        # Normalize to [-1, 1]
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    
-    # Transforms for the segmentation mask
-    mask_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.PILToTensor(), # This will scale 0-255 to [0, 1]. The mask is 1, 2, 3.
-        # The mask values are 1 (pet), 2 (background), 3 (border).
-        # We only care about the pet. Let's make a binary mask.
-        lambda x: (x == 1).float(), # 1 if pet, 0 if background/border
-        transforms.Normalize((0.5,), (0.5,)) # Normalize [0, 1] to [-1, 1]
-    ])
-
-    dataset = OxfordIIITPet(
-        root=root_dir, 
-        split="trainval", 
-        download=True, 
-        target_types="segmentation",
-        transform=image_transform,
-        target_transform=mask_transform
-    )
-
-    # pet_class_name = "asd"
-    # print(f"Filtering dataset for pet class: '{pet_class_name}'")
-    
-    # # 1. Find the numerical index of the desired class
-    # try:
-    #     class_idx = dataset.classes.index(pet_class_name)
-    # except ValueError:
-    #     print(f"Error: Pet class '{pet_class_name}' not found.")
-    #     print(f"Available classes are: {dataset.classes}")
-    #     return None, None
-        
-    # # 2. Get the indices of all samples matching this class index
-    # indices = [i for i, label in enumerate(dataset._labels) if label == class_idx]
-    
-    # if not indices:
-    #     print(f"No samples found for class: {pet_class_name}")
-    #     return None, None
-    
     indices = list(range(len(dataset)))
     print(f"Found {len(indices)} samples for dataset.")
     
@@ -179,14 +142,14 @@ def sample_and_save_images(model, noise_scheduler, test_dataloader, device, epoc
     # Get a batch of test data
     try:
         batch = next(iter(test_dataloader))
-        clean_images, ground_truth_masks = batch
-        clean_images, ground_truth_masks = clean_images.to(device), ground_truth_masks.to(device)
+        clean_images, coarse_mask, gt_mask = batch
+        clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
     except Exception as e:
         print(f"Error getting test batch: {e}")
         return
 
     # Start with pure noise for the mask
-    noisy_masks = torch.randn_like(ground_truth_masks)
+    noisy_masks = torch.randn_like(gt_mask)
     
     with torch.no_grad():
         # Loop backwards through the diffusion timesteps
@@ -194,7 +157,7 @@ def sample_and_save_images(model, noise_scheduler, test_dataloader, device, epoc
             
             # 1. Concatenate the noisy mask and the condition (RGB image)
             # Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
             
             # 2. Predict the noise
             noise_pred = model(model_input, t).sample
@@ -206,21 +169,23 @@ def sample_and_save_images(model, noise_scheduler, test_dataloader, device, epoc
     # --- Un-normalize all images for saving ---
     # Un-normalize from [-1, 1] to [0, 1]
     clean_images = (clean_images * 0.5 + 0.5).clamp(0, 1)
+    coarse_mask = (coarse_mask * 0.5 + 0.5).clamp(0, 1)
     predicted_masks = (noisy_masks * 0.5 + 0.5).clamp(0, 1)
-    ground_truth_masks = (ground_truth_masks * 0.5 + 0.5).clamp(0, 1)
+    gt_mask = (gt_mask * 0.5 + 0.5).clamp(0, 1)
     
     # Make masks 3-channel for grid
+    coarse_mask = coarse_mask.repeat(1, 3, 1, 1)
     predicted_masks = predicted_masks.repeat(1, 3, 1, 1)
-    ground_truth_masks = ground_truth_masks.repeat(1, 3, 1, 1)
+    gt_mask = gt_mask.repeat(1, 3, 1, 1)
 
     # Create a grid: [Image | Predicted Mask | Ground Truth]
-    comparison_grid = torch.cat([clean_images, predicted_masks, ground_truth_masks], dim=0)
+    comparison_grid = torch.cat([clean_images, coarse_mask, predicted_masks, gt_mask], dim=0)
     
     # Save the grid
     save_path = os.path.join(output_dir, f"sample_epoch_{epoch}.png")
     torchvision.utils.save_image(comparison_grid, save_path, nrow=clean_images.shape[0])
     print(f"Saved sample grid to {save_path}")
-    
+
     model.train()
 
 
@@ -232,13 +197,13 @@ def validate(model, noise_scheduler, val_dataloader, device):
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validating"):
-            clean_images, clean_masks = batch
-            clean_images, clean_masks = clean_images.to(device), clean_masks.to(device)
+            clean_images, coarse_mask, gt_mask = batch
+            clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
             
             # 1. Sample a random noise map for the mask
-            noise = torch.randn_like(clean_masks)
+            noise = torch.randn_like(coarse_mask)
             
             # 2. Sample random timesteps
             timesteps = torch.randint(
@@ -246,10 +211,10 @@ def validate(model, noise_scheduler, val_dataloader, device):
             ).long()
             
             # 3. Add noise to the clean masks
-            noisy_masks = noise_scheduler.add_noise(clean_masks, noise, timesteps)
+            noisy_masks = noise_scheduler.add_noise(gt_mask, noise, timesteps)
             
             # 4. Concatenate noisy mask and clean image
-            model_input = torch.cat([noisy_masks, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
             noise_pred = model(model_input, timesteps).sample
@@ -269,7 +234,7 @@ def train_model(args):
     """Main end-to-end training function."""
     
     exp_id = generate_random_id()
-    args.output_dir = f"{exp_id}_" + args.output_dir
+    args.output_dir = os.path.join(args.output_dir, exp_id)
     # --- 1. Initialize wandb ---
     wandb.init(
         project="diffusion-segmentation",
@@ -281,23 +246,19 @@ def train_model(args):
     # --- 2. Load and Preprocess Dataset ---
     print("Loading dataset...")
     train_dataloader, val_dataloader, test_dataloader_for_sampling = get_train_val_dataloaders(
-        args.image_size, 
-        args.batch_size, 
-        args.data_root_dir,
+        args.image_size,
+        args.batch_size,
+        os.path.join(args.data_root_dir, "oxcoarse"),
         val_split=args.val_split
     )
-    
-    if train_dataloader is None or val_dataloader is None:
-        print("Failed to load dataset. Exiting.")
-        return
-    
+
     # --- 3. Define the Model, Scheduler, and Optimizer ---
     print("Initializing model...")
     # KEY CHANGE: in_channels=4 (1 for mask + 3 for RGB)
     #             out_channels=1 (to predict noise for the mask)
     model = UNet2DModel(
         sample_size=args.image_size,
-        in_channels=4,  # <-- The CRITICAL change
+        in_channels=5,  # <-- The CRITICAL change
         out_channels=1, # <-- The CRITICAL change
         layers_per_block=2,
         block_out_channels=(64, 128, 128, 256), # A slightly larger UNet
@@ -332,13 +293,13 @@ def train_model(args):
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}")
         
         for step, batch in enumerate(train_dataloader):
-            clean_images, clean_masks = batch
-            clean_images, clean_masks = clean_images.to(device), clean_masks.to(device)
+            clean_images, coarse_mask, gt_mask = batch
+            clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
 
             # 1. Sample a random noise map *for the mask*
-            noise = torch.randn_like(clean_masks)
+            noise = torch.randn_like(coarse_mask)
             
             # 2. Sample random timesteps
             timesteps = torch.randint(
@@ -346,11 +307,11 @@ def train_model(args):
             ).long()
 
             # 3. Add noise to the *clean masks*
-            noisy_masks = noise_scheduler.add_noise(clean_masks, noise, timesteps)
+            noisy_masks = noise_scheduler.add_noise(gt_mask, noise, timesteps)
             
             # 4. Concatenate noisy mask and clean image
             #    Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
             noise_pred = model(model_input, timesteps).sample
@@ -417,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=20)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
-    parser.add_argument("--output_dir", type=str, default="test_segmentation")
+    parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
     parser.add_argument("--val_split", type=float, default=0.2)
     args = parser.parse_args()
