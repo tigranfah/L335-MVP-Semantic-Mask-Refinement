@@ -23,15 +23,13 @@ if __name__ == "__main__":
     image_size = 256
     BASELINE_OUTPUT_CHANNELS = 1 #with one chanel we can do background + (pet&boundry)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    val_split = 0.2
     batch_size = 64
 
     # Transforms for the RGB image
     image_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        lambda x: x.float(),
-        # Normalize to [-1, 1]
-        transforms.Normalize((255 / 2, 255 / 2, 255 / 2), (255 / 2, 255 / 2, 255 / 2)),
+        transforms.ToTensor(),  # [0, 1]
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # → [-1, 1]
     ])
     
     # Transforms for the segmentation mask
@@ -52,27 +50,44 @@ if __name__ == "__main__":
         target_transform=mask_transform
     )
 
-    # Split dataset into train and validation
+    # ============================================================
+    # Split dataset into Train / Refiner / Dev / Test (40 / 40 / 10 / 10)
+    # ============================================================
     indices = list(range(len(dataset)))
     random.seed(42)  # For reproducibility
     random.shuffle(indices)
-    split_idx = int(len(indices) * (1 - val_split))
-    train_indices = indices[:split_idx]
-    val_indices = indices[split_idx:]
-    print(f"Total samples: {len(indices)}")
-    print(f"Train samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
-    
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
 
-    # Training loader: shuffle for randomness, keep all samples (drop_last=False)
+    total_len = len(indices)
+    train_end = int(0.4 * total_len)
+    refiner_end = int(0.8 * total_len)
+    dev_end = int(0.9 * total_len)
+
+    train_indices = indices[:train_end]
+    refiner_indices = indices[train_end:refiner_end]
+    dev_indices = indices[refiner_end:dev_end]
+    test_indices = indices[dev_end:]
+
+    print(f"Total samples: {total_len}")
+    print(f"Train: {len(train_indices)} | Refiner: {len(refiner_indices)} | "
+        f"Dev: {len(dev_indices)} | Test: {len(test_indices)}")
+
+    # Create subsets
+    train_dataset = Subset(dataset, train_indices)
+    refiner_dataset = Subset(dataset, refiner_indices)
+    dev_dataset = Subset(dataset, dev_indices)
+    test_dataset = Subset(dataset, test_indices)
+
+    # ------------------------------------------------------------
+    # Data loaders
+    # ------------------------------------------------------------
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=False)
-    # Validation loader: no shuffle for deterministic evaluation, keep all samples
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-    
-    # Separate loaders for mask generation: no shuffle for deterministic file naming, keep all samples
+    refiner_loader = DataLoader(refiner_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+    dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+
+    # Deterministic loaders for generating coarse masks (no shuffle)
     train_loader_for_masks = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-    val_loader_for_masks = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+    refiner_loader_for_masks = DataLoader(refiner_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
 
 
     # Model checkpoint path
@@ -170,18 +185,18 @@ if __name__ == "__main__":
     
     dataset_dir = "data/oxcoarse"
     
-    # Generate masks for training set (model was trained on this)
-    print("\nGenerating masks for training set...")
-    train_count = generate_and_save_masks(train_loader_for_masks, dataset_dir, "train")
+    # Generate masks for training set (model was NOT trained on this)
+    print("\nGenerating masks for REFINEMENT training set...")
+    train_count = generate_and_save_masks(refiner_loader, dataset_dir, "train")
     print(f"Saved {train_count} training samples")
     
-    # Generate masks for validation set (model was NOT trained on this)
-    print("\nGenerating masks for validation set...")
-    val_count = generate_and_save_masks(val_loader_for_masks, dataset_dir, "val")
-    print(f"Saved {val_count} validation samples")
+    # Generate masks for DEV set (model was NOT trained on this)
+    print("\nGenerating masks for DEV set...")
+    dev_count = generate_and_save_masks(dev_loader, dataset_dir, "val")
+    print(f"Saved {dev_count} validation samples")
     
     print(f"\nCoarse masks generated and saved to {dataset_dir}")
-    print(f"Total samples saved: {train_count} train + {val_count} val = {train_count + val_count}")
+    print(f"Total samples saved: {train_count} train + {dev_count} val = {train_count + dev_count}")
 
 
 
