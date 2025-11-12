@@ -2,3 +2,4 @@
 data
 diffusion_cifar10_model
 wandb
+**/__pycache__
