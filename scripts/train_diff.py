@@ -122,20 +122,30 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
     
     print(f"Train samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
     
+    test_size = 64
+    
     # 4. Create Subset datasets
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, val_indices[:6])
+    test_dataset = Subset(dataset, val_indices[:test_size])
     
     # 5. Create DataLoaders
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=test_size, shuffle=False, num_workers=2, drop_last=False)
     
     return train_dataloader, val_dataloader, test_dataloader
 
 
-def sample_and_save_images(model, noise_scheduler, test_dataloader, device, epoch, output_dir):
+def sample_and_save_images(
+    model,
+    noise_scheduler,
+    test_dataloader,
+    device,
+    epoch,
+    output_dir,
+    metrics_dict
+):
     """Samples and saves a grid of images for visual inspection."""
     model.eval()
     
@@ -177,6 +187,30 @@ def sample_and_save_images(model, noise_scheduler, test_dataloader, device, epoc
     coarse_mask = coarse_mask.repeat(1, 3, 1, 1)
     predicted_masks = predicted_masks.repeat(1, 3, 1, 1)
     gt_mask = gt_mask.repeat(1, 3, 1, 1)
+
+    iou_score = metrics_dict["iou"](
+        predicted_masks, 
+        gt_mask
+    )
+    psnr = metrics_dict["psnr"](
+        predicted_masks, 
+        gt_mask
+    )
+    baseline_iou_score = metrics_dict["iou"](
+        coarse_mask, 
+        gt_mask
+    )
+    baseline_psnr = metrics_dict["psnr"](
+        coarse_mask, 
+        gt_mask
+    )
+    wandb.log({
+        "val/baseline_iou_score": baseline_iou_score,
+        "val/baseline_psnr": baseline_psnr,
+        "val/iou_score": iou_score,
+        "val/psnr": psnr,
+    })
+    
 
     # Create a grid: [Image | Predicted Mask | Ground Truth]
     comparison_grid = torch.cat([clean_images, coarse_mask, predicted_masks, gt_mask], dim=0)
@@ -287,6 +321,9 @@ def train_model(args):
     
     os.makedirs(args.output_dir, exist_ok=True)
 
+    jaccard_index = JaccardIndex(task="binary", threshold=0.5).to(device)
+    psnr_metric = PeakSignalNoiseRatio().to(device)
+
     # --- 4. The Training Loop ---
     print("Starting training...")
     for epoch in range(args.num_epochs):
@@ -358,7 +395,11 @@ def train_model(args):
             test_dataloader_for_sampling, 
             device, 
             epoch, 
-            args.output_dir
+            args.output_dir,
+            metrics_dict={
+                "iou": jaccard_index,
+                "psnr": psnr_metric,
+            }
         )
 
     print("Training finished.")
@@ -375,11 +416,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_epochs", type=int, default=20)
+    parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
-    parser.add_argument("--val_split", type=float, default=0.2)
+    parser.add_argument("--val_split", type=float, default=0.1)
     args = parser.parse_args()
     train_model(args)
