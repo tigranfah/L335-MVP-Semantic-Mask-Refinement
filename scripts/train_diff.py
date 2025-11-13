@@ -85,53 +85,37 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
     # Transforms for the RGB image
     image_transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        lambda x: x.float(),
-        # Normalize to [-1, 1]
-        transforms.Normalize((255 / 2, 255 / 2, 255 / 2), (255 / 2, 255 / 2, 255 / 2)),
     ])
     
     # Transforms for the segmentation mask
     mask_transform = transforms.Compose([
         transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-        # The mask values are 1 (pet), 2 (background), 3 (border).
-        # We only care about the pet. Let's make a binary mask.
-        lambda x: ((x == 1) | (x == 3)).float(), # 1 if pet, 0 if background/border
-        transforms.Normalize((0.5,), (0.5,)) # Normalize [0, 1] to [-1, 1]
     ])
     coarse_mask_transform = transforms.Compose([
         transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.Normalize((0.5,), (0.5,)) # Normalize [0, 1] to [-1, 1]
     ])
 
-    dataset = CoarseOxfordIIITPet(
-        root_dir,
+    train_dataset = CoarseOxfordIIITPet(
+        os.path.join(root_dir, "train"),
         image_transform=image_transform,
         mask_transform=mask_transform,
         coarse_mask_transform=coarse_mask_transform
     )
+    dev_dataset = CoarseOxfordIIITPet(
+        os.path.join(root_dir, "dev"),
+        image_transform=image_transform,
+        mask_transform=mask_transform,
+        coarse_mask_transform=coarse_mask_transform
+    )
+    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(dev_dataset)}")
 
-    indices = list(range(len(dataset)))
-    print(f"Found {len(indices)} samples for dataset.")
-    
-    # 3. Split indices into train and validation
-    random.seed(42)  # For reproducibility
-    random.shuffle(indices)
-    split_idx = int(len(indices) * (1 - val_split))
-    train_indices = indices[:split_idx]
-    val_indices = indices[split_idx:]
-    
-    print(f"Train samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
-    
     test_size = 64
-    
-    # 4. Create Subset datasets
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, val_indices[:test_size])
+
+    test_dataset = Subset(dev_dataset, list(range(len(dev_dataset)))[:test_size])
     
     # 5. Create DataLoaders
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
+    val_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
     test_dataloader = DataLoader(test_dataset, batch_size=test_size, shuffle=False, num_workers=2, drop_last=False)
     
     return train_dataloader, val_dataloader, test_dataloader
@@ -159,7 +143,8 @@ def sample_and_save_images(
         return
 
     # Start with pure noise for the mask
-    noisy_masks = torch.randn_like(gt_mask)
+    # noisy_masks = torch.randn_like(gt_mask)
+    noisy_masks = coarse_mask
     
     with torch.no_grad():
         # Loop backwards through the diffusion timesteps
@@ -171,10 +156,13 @@ def sample_and_save_images(
             
             # 2. Predict the noise
             noise_pred = model(model_input, t).sample
-            
+
             # 3. Use the scheduler to "denoise" one step
             scheduler_output = noise_scheduler.step(noise_pred, t, noisy_masks)
             noisy_masks = scheduler_output.prev_sample
+
+        # Update the coarse mask
+        # noisy_masks = coarse_mask - noisy_masks
 
     # --- Un-normalize all images for saving ---
     # Un-normalize from [-1, 1] to [0, 1]
@@ -197,7 +185,7 @@ def sample_and_save_images(
         gt_mask
     )
     baseline_iou_score = metrics_dict["iou"](
-        coarse_mask, 
+        coarse_mask,
         gt_mask
     )
     baseline_psnr = metrics_dict["psnr"](
@@ -210,7 +198,6 @@ def sample_and_save_images(
         "val/iou_score": iou_score,
         "val/psnr": psnr,
     })
-    
 
     # Create a grid: [Image | Predicted Mask | Ground Truth]
     comparison_grid = torch.cat([clean_images, coarse_mask, predicted_masks, gt_mask], dim=0)
@@ -235,16 +222,16 @@ def validate(model, noise_scheduler, val_dataloader, device):
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
-            
-            # 1. Sample a random noise map for the mask
-            noise = torch.randn_like(coarse_mask)
-            
-            # 2. Sample random timesteps
+
+            # 1. Sample random timesteps
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device
             ).long()
-            
-            # 3. Add noise to the clean masks
+
+            # 2. Sample a random noise map *for the mask*
+            noise = torch.randn_like(coarse_mask)
+
+            # 3. Add noise to the *clean masks*
             noisy_masks = noise_scheduler.add_noise(gt_mask, noise, timesteps)
             
             # 4. Concatenate noisy mask and clean image
@@ -290,14 +277,23 @@ def train_model(args):
     print("Initializing model...")
     # KEY CHANGE: in_channels=4 (1 for mask + 3 for RGB)
     #             out_channels=1 (to predict noise for the mask)
+    # model = UNet2DModel(
+    #     sample_size=args.image_size,
+    #     in_channels=5,  # <-- The CRITICAL change
+    #     out_channels=1, # <-- The CRITICAL change
+    #     layers_per_block=1,
+    #     block_out_channels=(64, 128, 256), # A slightly larger UNet
+    #     down_block_types=("DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
+    #     up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D"),
+    # )
     model = UNet2DModel(
         sample_size=args.image_size,
-        in_channels=5,  # <-- The CRITICAL change
-        out_channels=1, # <-- The CRITICAL change
-        layers_per_block=2,
-        block_out_channels=(64, 128, 128, 256), # A slightly larger UNet
-        down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-        up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
+        in_channels=5,
+        out_channels=1,
+        layers_per_block=1,
+        block_out_channels=(32, 64, 128), # Halve the channels
+        down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D"), # No attention
+        up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D"),     # No attention
     )
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=args.num_train_timesteps)
@@ -334,21 +330,21 @@ def train_model(args):
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
-
-            # 1. Sample a random noise map *for the mask*
-            noise = torch.randn_like(coarse_mask)
             
-            # 2. Sample random timesteps
+            # 1. Sample random timesteps
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device
             ).long()
+
+            # 2. Sample a random noise map *for the mask*
+            noise = torch.randn_like(coarse_mask)
 
             # 3. Add noise to the *clean masks*
             noisy_masks = noise_scheduler.add_noise(gt_mask, noise, timesteps)
             
             # 4. Concatenate noisy mask and clean image
             #    Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, gt_mask, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
             noise_pred = model(model_input, timesteps).sample

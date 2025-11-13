@@ -3,7 +3,7 @@ import torch
 from tqdm.auto import tqdm
 from scripts.data_utils import get_loaders
 from model.baseline_unet import UNetSmall
-from scripts.train_baseline import train_baseline   
+from scripts.train_baseline import train_baseline
 
 
 def generate_and_save_masks(model, dataloader, dataset_dir, split_name, device):
@@ -18,7 +18,7 @@ def generate_and_save_masks(model, dataloader, dataset_dir, split_name, device):
             images = images.to(device)
             coarse_logits = model(images)
             # coarse_masks = torch.sigmoid(coarse_logits)
-            coarse_masks = (torch.sigmoid(coarse_logits) > 0.5).float()
+            coarse_masks = ((torch.sigmoid(coarse_logits) > 0.5).float() - 0.5) * 2 # [-1, 1]
             for i in range(images.shape[0]):
                 torch.save(images[i].cpu(), os.path.join(dataset_dir, split_name, "images", f"{idx:06d}.pt"))
                 torch.save(coarse_masks[i].cpu(), os.path.join(dataset_dir, split_name, "coarse_masks", f"{idx:06d}.pt"))
