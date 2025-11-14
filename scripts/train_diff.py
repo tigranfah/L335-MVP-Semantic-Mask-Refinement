@@ -1,8 +1,11 @@
 from typing import NoReturn
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
 from torchvision.datasets import OxfordIIITPet
+from torchvision import transforms
+import albumentations as A
+import numpy as np
+import torchvision.tv_tensors as tv_tensors
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchmetrics import JaccardIndex, PeakSignalNoiseRatio
 import random
@@ -39,11 +42,12 @@ class CoarseOxfordIIITPet(Dataset):
         ├── 000000.pt
         └── ...
     """
-    def __init__(self, root_dir, image_transform=None, mask_transform=None, coarse_mask_transform=None):
+    def __init__(
+        self, root_dir,
+        img_transforms
+    ):
         self.root_dir = root_dir
-        self.image_transform = image_transform
-        self.mask_transform = mask_transform
-        self.coarse_mask_transform = coarse_mask_transform
+        self.img_transforms = img_transforms
         
         self.image_dir = os.path.join(root_dir, "images")
         self.coarse_mask_dir = os.path.join(root_dir, "coarse_masks")
@@ -68,48 +72,47 @@ class CoarseOxfordIIITPet(Dataset):
         image = torch.load(os.path.join(self.image_dir, file_name))
         coarse_mask = torch.load(os.path.join(self.coarse_mask_dir, file_name))
         gt_mask = torch.load(os.path.join(self.gt_mask_dir, file_name))
+
+        # image: [C, H, W] float -> [H, W, C] float
+        image = image.permute(1, 2, 0).cpu().numpy()
+        # masks: [H, W] long -> [H, W] long
+        coarse_mask = coarse_mask.cpu().numpy().squeeze(0)
+        gt_mask = gt_mask.cpu().numpy().squeeze(0)
         
-        # Apply any *additional* transforms (e.g., data augmentation)
-        # Note: Resizing/Normalization is already done!
-        if self.image_transform:
-            image = self.image_transform(image)
-        if self.mask_transform:
-            gt_mask = self.mask_transform(gt_mask)
-        if self.coarse_mask_transform:
-            coarse_mask = self.coarse_mask_transform(coarse_mask)
-            
+        transformed = self.img_transforms(image=image, coarse_mask=coarse_mask, gt_mask=gt_mask)
+        image = transformed["image"]
+        coarse_mask = transformed["coarse_mask"]
+        gt_mask = transformed["gt_mask"]
+
+        # image: [H, W, C] -> [C, H, W]
+        image = torch.from_numpy(image).permute(2, 0, 1)
+        # masks: [H, W] -> [H, W]
+        coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0)
+        gt_mask = torch.from_numpy(gt_mask).unsqueeze(0)
+        
         return image, coarse_mask, gt_mask
 
 
 def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):    
     # Transforms for the RGB image
-    image_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-    ])
-    
-    # Transforms for the segmentation mask
-    mask_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-    ])
-    coarse_mask_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-    ])
+    img_transforms = A.Compose([
+        A.Resize(height=image_size, width=image_size),
+        A.Rotate(limit=15, p=0.5, fill=0, fill_mask=-1),
+        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=0, fill_mask=-1),
+        A.HorizontalFlip(p=0.5),
+    ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
 
     train_dataset = CoarseOxfordIIITPet(
         os.path.join(root_dir, "train"),
-        image_transform=image_transform,
-        mask_transform=mask_transform,
-        coarse_mask_transform=coarse_mask_transform
+        img_transforms=img_transforms
     )
     dev_dataset = CoarseOxfordIIITPet(
         os.path.join(root_dir, "dev"),
-        image_transform=image_transform,
-        mask_transform=mask_transform,
-        coarse_mask_transform=coarse_mask_transform
+        img_transforms=img_transforms
     )
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(dev_dataset)}")
 
-    test_size = 64
+    test_size = 16
 
     test_dataset = Subset(dev_dataset, list(range(len(dev_dataset)))[:test_size])
     
@@ -143,8 +146,7 @@ def sample_and_save_images(
         return
 
     # Start with pure noise for the mask
-    # noisy_masks = torch.randn_like(gt_mask)
-    noisy_masks = coarse_mask
+    noisy_masks = torch.randn_like(gt_mask)
     
     with torch.no_grad():
         # Loop backwards through the diffusion timesteps
@@ -163,6 +165,10 @@ def sample_and_save_images(
 
         # Update the coarse mask
         # noisy_masks = coarse_mask - noisy_masks
+
+    # diff_mask = coarse_mask - gt_mask
+    # diff_mask = (diff_mask * 0.5 + 0.5).clamp(0, 1)
+    # diff_mask = diff_mask.repeat(1, 3, 1, 1)
 
     # --- Un-normalize all images for saving ---
     # Un-normalize from [-1, 1] to [0, 1]
@@ -344,7 +350,7 @@ def train_model(args):
             
             # 4. Concatenate noisy mask and clean image
             #    Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, gt_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
             noise_pred = model(model_input, timesteps).sample
@@ -384,19 +390,20 @@ def train_model(args):
             "val/epoch": epoch
         })
         
-        # --- 6. Sample and Save Images at end of epoch ---
-        sample_and_save_images(
-            model, 
-            noise_scheduler, 
-            test_dataloader_for_sampling, 
-            device, 
-            epoch, 
-            args.output_dir,
-            metrics_dict={
-                "iou": jaccard_index,
-                "psnr": psnr_metric,
-            }
-        )
+        if epoch % 10 == 0:
+            # --- 6. Sample and Save Images at end of epoch ---
+            sample_and_save_images(
+                model, 
+                noise_scheduler, 
+                test_dataloader_for_sampling, 
+                device, 
+                epoch, 
+                args.output_dir,
+                metrics_dict={
+                    "iou": jaccard_index,
+                    "psnr": psnr_metric,
+                }
+            )
 
     print("Training finished.")
     
@@ -411,7 +418,7 @@ def train_model(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_size", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
