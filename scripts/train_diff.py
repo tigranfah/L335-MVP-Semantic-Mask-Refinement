@@ -72,25 +72,32 @@ class CoarseOxfordIIITPet(Dataset):
         image = torch.load(os.path.join(self.image_dir, file_name))
         coarse_mask = torch.load(os.path.join(self.coarse_mask_dir, file_name))
         gt_mask = torch.load(os.path.join(self.gt_mask_dir, file_name))
-
-        # image: [C, H, W] float -> [H, W, C] float
-        image = image.permute(1, 2, 0).cpu().numpy()
-        # masks: [H, W] long -> [H, W] long
-        coarse_mask = coarse_mask.cpu().numpy().squeeze(0)
-        gt_mask = gt_mask.cpu().numpy().squeeze(0)
-        
-        transformed = self.img_transforms(image=image, coarse_mask=coarse_mask, gt_mask=gt_mask)
-        image = transformed["image"]
-        coarse_mask = transformed["coarse_mask"]
-        gt_mask = transformed["gt_mask"]
-
-        # image: [H, W, C] -> [C, H, W]
-        image = torch.from_numpy(image).permute(2, 0, 1)
-        # masks: [H, W] -> [H, W]
-        coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0)
-        gt_mask = torch.from_numpy(gt_mask).unsqueeze(0)
         
         return image, coarse_mask, gt_mask
+
+
+def dynamic_augment_collate_fn(batch_data, image_transforms):
+    image, coarse_mask, gt_mask = batch_data
+
+    # image: [C, H, W] float -> [H, W, C] float
+    image = image.permute(1, 2, 0).cpu().numpy()
+    # masks: [H, W] long -> [H, W] long
+    coarse_mask = coarse_mask.cpu().numpy().squeeze(0)
+    gt_mask = gt_mask.cpu().numpy().squeeze(0)
+    
+    transformed = image_transforms(image=image, coarse_mask=coarse_mask, gt_mask=gt_mask)
+    image = transformed["image"]
+    coarse_mask = transformed["coarse_mask"]
+    gt_mask = transformed["gt_mask"]
+
+    # image: [H, W, C] -> [C, H, W]
+    image = torch.from_numpy(image).permute(2, 0, 1)
+    # masks: [H, W] -> [H, W]
+    coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0)
+    gt_mask = torch.from_numpy(gt_mask).unsqueeze(0)
+
+    return image, coarse_mask, gt_mask
+
 
 
 def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):    
@@ -103,12 +110,10 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
     ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
 
     train_dataset = CoarseOxfordIIITPet(
-        os.path.join(root_dir, "train"),
-        img_transforms=img_transforms
+        os.path.join(root_dir, "train")
     )
     dev_dataset = CoarseOxfordIIITPet(
-        os.path.join(root_dir, "dev"),
-        img_transforms=img_transforms
+        os.path.join(root_dir, "dev")
     )
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(dev_dataset)}")
 
@@ -117,9 +122,30 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
     test_dataset = Subset(dev_dataset, list(range(len(dev_dataset)))[:test_size])
     
     # 5. Create DataLoaders
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
-    val_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=test_size, shuffle=False, num_workers=2, drop_last=False)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        drop_last=True,
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+    )
+    val_dataloader = DataLoader(
+        dev_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        drop_last=False,
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=test_size,
+        shuffle=False,
+        num_workers=2,
+        drop_last=False,
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+    )
     
     return train_dataloader, val_dataloader, test_dataloader
 
