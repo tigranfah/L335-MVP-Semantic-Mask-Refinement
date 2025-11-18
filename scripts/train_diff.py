@@ -145,8 +145,13 @@ def sample_and_save_images(
         print(f"Error getting test batch: {e}")
         return
 
+    # encode the images to latent space
+    with torch.no_grad():
+        clean_images_latent = vae.encode(clean_images).latent_dist.sample()
+        coarse_mask_latent = vae_mask.encode(coarse_mask).latent_dist.sample()
+
     # Start with pure noise for the mask
-    noisy_masks = torch.randn_like(gt_mask)
+    noisy_masks = torch.randn_like(coarse_mask_latent)
     
     with torch.no_grad():
         # Loop backwards through the diffusion timesteps
@@ -154,7 +159,7 @@ def sample_and_save_images(
             
             # 1. Concatenate the noisy mask and the condition (RGB image)
             # Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, coarse_mask_latent, clean_images_latent], dim=1)
             
             # 2. Predict the noise
             noise_pred = model(model_input, t).sample
@@ -172,6 +177,11 @@ def sample_and_save_images(
 
     # --- Un-normalize all images for saving ---
     # Un-normalize from [-1, 1] to [0, 1]
+
+    # decode the produced mask from latent space
+    with torch.no_grad():
+        predicted_masks = vae_mask.decode(noisy_masks).sample
+
     clean_images = (clean_images * 0.5 + 0.5).clamp(0, 1)
     coarse_mask = (coarse_mask * 0.5 + 0.5).clamp(0, 1)
     predicted_masks = (noisy_masks * 0.5 + 0.5).clamp(0, 1)
@@ -221,6 +231,14 @@ def validate(model, noise_scheduler, val_dataloader, device):
     model.eval()
     total_loss = 0.0
     num_batches = 0
+
+    #autoencoder!
+    url = "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/blob/main/vae-ft-mse-840000-ema-pruned.safetensors"
+    vae = AutoencoderKL.from_single_file(url).to(device)
+    vae.eval()
+
+    vae_mask = AutoencoderKL.from_single_file(url).to(device)
+    vae_mask.eval()
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validating"):
@@ -228,6 +246,12 @@ def validate(model, noise_scheduler, val_dataloader, device):
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
+
+            # encode the images to latent space
+            with torch.no_grad():
+                clean_images = vae.encode(clean_images).latent_dist.sample()
+                coarse_mask = vae_mask.encode(coarse_mask).latent_dist.sample()
+                gt_mask = vae_mask.encode(gt_mask).latent_dist.sample()
 
             # 1. Sample random timesteps
             timesteps = torch.randint(
@@ -326,6 +350,14 @@ def train_model(args):
     jaccard_index = JaccardIndex(task="binary", threshold=0.5).to(device)
     psnr_metric = PeakSignalNoiseRatio().to(device)
 
+    #autoencoder!
+    url = "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/blob/main/vae-ft-mse-840000-ema-pruned.safetensors"
+    vae = AutoencoderKL.from_single_file(url).to(device)
+    vae.eval()
+
+    vae_mask = AutoencoderKL.from_single_file(url).to(device)
+    vae_mask.eval()
+
     # --- 4. The Training Loop ---
     print("Starting training...")
     for epoch in range(args.num_epochs):
@@ -337,6 +369,12 @@ def train_model(args):
             
             batch_size = clean_images.shape[0]
             
+            # encode  to latent space
+            with torch.no_grad():
+                clean_images = vae.encode(clean_images).latent_dist.sample()
+                coarse_mask = vae_mask.encode(coarse_mask).latent_dist.sample()
+                gt_mask = vae_mask.encode(gt_mask).latent_dist.sample()
+
             # 1. Sample random timesteps
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device
