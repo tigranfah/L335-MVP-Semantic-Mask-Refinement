@@ -1,7 +1,6 @@
 from typing import NoReturn
 import torch
 import torch.nn.functional as F
-from torchvision.datasets import OxfordIIITPet
 from torchvision import transforms
 import albumentations as A
 import numpy as np
@@ -18,109 +17,68 @@ import wandb
 import random
 import string
 import argparse
-import glob
+from coco_dataset import COCOSegmentationDataset
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def generate_random_id(length=6):
     return "".join(random.sample(string.ascii_lowercase + string.digits, k=length))
 
 
-class CoarseOxfordIIITPet(Dataset):
-    """
-    A PyTorch Dataset that loads pre-generated tensor files from disk.
-    
-    It assumes a directory structure created by 'pregenerate_dataset.py':
-    root_dir/
-    ├── images/
-    │   ├── 000000.pt
-    │   ├── 000001.pt
-    │   └── ...
-    ├── coarse_masks/
-    │   ├── 000000.pt
-    │   └── ...
-    └── gt_masks/
-        ├── 000000.pt
-        └── ...
-    """
-    def __init__(
-        self, root_dir
-    ):
-        self.root_dir = root_dir
-        
-        self.image_dir = os.path.join(root_dir, "images")
-        self.coarse_mask_dir = os.path.join(root_dir, "coarse_masks")
-        self.gt_mask_dir = os.path.join(root_dir, "gt_masks")
-        
-        # Get the list of file names (e.g., "000000.pt")
-        # We assume all directories are in sync
-        self.file_names = sorted(
-            [os.path.basename(f) for f in glob.glob(os.path.join(self.image_dir, "*.pt"))]
-        )
-        
-        if not self.file_names:
-            raise FileNotFoundError(f"No '.pt' files found in {self.image_dir}")
-
-    def __len__(self):
-        return len(self.file_names)
-
-    def __getitem__(self, idx):
-        file_name = self.file_names[idx]
-        
-        # Load the pre-saved tensors
-        image = torch.load(os.path.join(self.image_dir, file_name))
-        coarse_mask = torch.load(os.path.join(self.coarse_mask_dir, file_name))
-        gt_mask = torch.load(os.path.join(self.gt_mask_dir, file_name))
-        
-        return image, coarse_mask, gt_mask
-
-
 def dynamic_augment_collate_fn(batch_data, image_transforms):
     augmented_images = []
-    augmented_coarse_masks = []
     augmented_gt_masks = []
-
+    augmented_coarse_masks = []
     for batch in batch_data:
         image, coarse_mask, gt_mask = batch
 
         # image: [C, H, W] float -> [H, W, C] float
         image = image.permute(1, 2, 0).cpu().numpy()
         # masks: [H, W] long -> [H, W] long
-        coarse_mask = coarse_mask.cpu().numpy().squeeze(0)
-        gt_mask = gt_mask.cpu().numpy().squeeze(0)
+        gt_mask = gt_mask.cpu().numpy()
+        coarse_mask = coarse_mask.cpu().numpy()
         
-        transformed = image_transforms(image=image, coarse_mask=coarse_mask, gt_mask=gt_mask)
+        transformed = image_transforms(image=image, gt_mask=gt_mask, coarse_mask=coarse_mask)
         image = transformed["image"]
-        coarse_mask = transformed["coarse_mask"]
         gt_mask = transformed["gt_mask"]
+        coarse_mask = transformed["coarse_mask"]
 
         # image: [H, W, C] -> [C, H, W]
         image = torch.from_numpy(image).permute(2, 0, 1)
         # masks: [H, W] -> [H, W]
-        coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0)
-        gt_mask = torch.from_numpy(gt_mask).unsqueeze(0)
-
+        gt_mask = torch.from_numpy(gt_mask).unsqueeze(0).to(image.dtype)
+        coarse_mask = torch.from_numpy(coarse_mask).unsqueeze(0).to(image.dtype)
         # accumulate augmented images, coarse masks, and gt masks
         augmented_images.append(image)
-        augmented_coarse_masks.append(coarse_mask)
         augmented_gt_masks.append(gt_mask)
+        augmented_coarse_masks.append(coarse_mask)
 
     return torch.stack(augmented_images), torch.stack(augmented_coarse_masks), torch.stack(augmented_gt_masks)
 
 
-def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):    
+def get_train_val_dataloaders(image_size, batch_size):
     # Transforms for the RGB image
     img_transforms = A.Compose([
         A.Resize(height=image_size, width=image_size),
         A.Rotate(limit=15, p=0.5, fill=0, fill_mask=-1),
         A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=0, fill_mask=-1),
         A.HorizontalFlip(p=0.5),
-    ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
+    ], additional_targets={"gt_mask": "mask", "coarse_mask": "mask"})
 
-    train_dataset = CoarseOxfordIIITPet(
-        os.path.join(root_dir, "train")
+    train_dataset = COCOSegmentationDataset(
+        coco_json_path="../coco/annotations/instances_train2017.json",
+        images_root="../coco/train2017",
+        category={"id": 3, "name": "car"},
     )
-    dev_dataset = CoarseOxfordIIITPet(
-        os.path.join(root_dir, "dev")
+    dev_dataset = COCOSegmentationDataset(
+        coco_json_path="../coco/annotations/instances_val2017.json",
+        images_root="../coco/val2017",
+        category={"id": 3, "name": "car"},
     )
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(dev_dataset)}")
 
@@ -187,7 +145,7 @@ def sample_and_save_images(
             
             # 1. Concatenate the noisy mask and the condition (RGB image)
             # Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, clean_images], dim=1)
             # model_input = torch.cat([noisy_masks, clean_images], dim=1)
             
             # 2. Predict the noise
@@ -206,10 +164,10 @@ def sample_and_save_images(
 
     # --- Un-normalize all images for saving ---
     # Un-normalize from [-1, 1] to [0, 1]
-    clean_images = (clean_images * 0.5 + 0.5).clamp(0, 1)
-    coarse_mask = (coarse_mask * 0.5 + 0.5).clamp(0, 1)
-    predicted_masks = (noisy_masks * 0.5 + 0.5).clamp(0, 1)
-    gt_mask = (gt_mask * 0.5 + 0.5).clamp(0, 1)
+    clean_images = clean_images.clamp(0, 1)
+    coarse_mask = coarse_mask.clamp(0, 1)
+    predicted_masks = noisy_masks.clamp(0, 1)
+    gt_mask = gt_mask.clamp(0, 1)
     
     # Make masks 3-channel for grid
     coarse_mask = coarse_mask.repeat(1, 3, 1, 1)
@@ -275,7 +233,7 @@ def validate(model, noise_scheduler, val_dataloader, device):
             noisy_masks = noise_scheduler.add_noise(gt_mask, noise, timesteps)
             
             # 4. Concatenate noisy mask and clean image
-            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, clean_images], dim=1)
             # model_input = torch.cat([noisy_masks, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
@@ -296,10 +254,11 @@ def train_model(args):
     """Main end-to-end training function."""
     
     exp_id = generate_random_id()
+    set_seed(42)
     args.output_dir = os.path.join(args.output_dir, exp_id)
     # --- 1. Initialize wandb ---
     wandb.init(
-        project="diffusion-segmentation",
+        project="diffusion-segmentation-coco",
         config=vars(args),
         name=exp_id,
         entity="tf426-cam"
@@ -310,8 +269,6 @@ def train_model(args):
     train_dataloader, val_dataloader, test_dataloader_for_sampling = get_train_val_dataloaders(
         args.image_size,
         args.batch_size,
-        os.path.join(args.data_root_dir, "oxcoarse"),
-        val_split=args.val_split
     )
 
     # --- 3. Define the Model, Scheduler, and Optimizer ---
@@ -329,8 +286,8 @@ def train_model(args):
     # )
     model = UNet2DModel(
         sample_size=args.image_size,
-        in_channels=5,
-        # in_channels=4,
+        # in_channels=5,
+        in_channels=4,
         out_channels=1,
         layers_per_block=1,
         block_out_channels=(32, 64, 128), # Halve the channels
@@ -386,7 +343,7 @@ def train_model(args):
             
             # 4. Concatenate noisy mask and clean image
             #    Input shape: (batch_size, 4, H, W)
-            model_input = torch.cat([noisy_masks, coarse_mask, clean_images], dim=1)
+            model_input = torch.cat([noisy_masks, clean_images], dim=1)
             # model_input = torch.cat([noisy_masks, clean_images], dim=1)
             
             # 5. Get the model's noise prediction
@@ -461,7 +418,5 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
-    parser.add_argument("--data_root_dir", type=str, default="./data")
-    parser.add_argument("--val_split", type=float, default=0.1)
     args = parser.parse_args()
     train_model(args)
