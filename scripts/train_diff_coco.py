@@ -30,6 +30,12 @@ def generate_random_id(length=6):
     return "".join(random.sample(string.ascii_lowercase + string.digits, k=length))
 
 
+def seed_worker(worker_id):
+    base_seed = torch.initial_seed()
+    np.random.seed(base_seed % (2**32 - 1))
+    random.seed(base_seed % (2**32 - 1))
+
+
 def dynamic_augment_collate_fn(batch_data, image_transforms):
     augmented_images = []
     augmented_gt_masks = []
@@ -91,25 +97,28 @@ def get_train_val_dataloaders(image_size, batch_size):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         drop_last=True,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms),
+        worker_init_fn=seed_worker,
     )
     val_dataloader = DataLoader(
         dev_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
         drop_last=False,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms),
+        worker_init_fn=seed_worker,
     )
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=test_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=2,
         drop_last=False,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms),
+        worker_init_fn=seed_worker,
     )
     
     return train_dataloader, val_dataloader, test_dataloader
@@ -384,7 +393,7 @@ def train_model(args):
             "val/epoch": epoch
         })
         
-        if epoch % 10 == 0:
+        if epoch % 4 == 0:
             # --- 6. Sample and Save Images at end of epoch ---
             sample_and_save_images(
                 model, 
@@ -412,7 +421,7 @@ def train_model(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--batch_size", type=int, default=48)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--num_epochs", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=3e-4)

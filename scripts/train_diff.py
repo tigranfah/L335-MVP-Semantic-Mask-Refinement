@@ -19,6 +19,7 @@ import random
 import string
 import argparse
 import glob
+# import time
 
 
 def generate_random_id(length=6):
@@ -75,6 +76,9 @@ class CoarseOxfordIIITPet(Dataset):
 
 
 def dynamic_augment_collate_fn(batch_data, image_transforms):
+    # set random seed to obtain random augmentations
+    # np.random.seed(time.time())
+
     augmented_images = []
     augmented_coarse_masks = []
     augmented_gt_masks = []
@@ -111,37 +115,37 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
     # Transforms for the RGB image
     img_transforms = A.Compose([
         A.Resize(height=image_size, width=image_size),
-        A.Rotate(limit=15, p=0.5, fill=0, fill_mask=-1),
-        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=0, fill_mask=-1),
+        A.Rotate(limit=15, p=0.5, fill=-1, fill_mask=-1),
+        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=-1, fill_mask=-1),
         A.HorizontalFlip(p=0.5),
     ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
 
     train_dataset = CoarseOxfordIIITPet(
         os.path.join(root_dir, "train")
     )
-    dev_dataset = CoarseOxfordIIITPet(
-        os.path.join(root_dir, "dev")
+    val_dataset = CoarseOxfordIIITPet(
+        os.path.join(root_dir, "val")
     )
-    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(dev_dataset)}")
+    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
     test_size = 16
 
-    test_dataset = Subset(dev_dataset, list(range(len(dev_dataset)))[:test_size])
+    test_dataset = Subset(val_dataset, list(range(len(val_dataset)))[:test_size])
     
     # 5. Create DataLoaders
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=2,
         drop_last=True,
         collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
     )
     val_dataloader = DataLoader(
-        dev_dataset,
+        val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=2,
         drop_last=False,
         collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
     )
@@ -149,7 +153,7 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
         test_dataset,
         batch_size=test_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=2,
         drop_last=False,
         collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
     )

@@ -35,6 +35,7 @@ if __name__ == "__main__":
     # Transforms for the segmentation mask
     mask_transform = transforms.Compose([
         transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.PILToTensor(),
         # The mask values are 1 (pet), 2 (background), 3 (border).
         # We only care about the pet. Let's make a binary mask.
         lambda x: ((x == 1) | (x == 3)).float(), # 1 if pet, 0 if background/border
@@ -49,31 +50,27 @@ if __name__ == "__main__":
         transform=image_transform,
         target_transform=mask_transform
     )
-
+    
     # ============================================================
     # Split dataset into Train / Refiner / Dev / Test (40 / 40 / 10 / 10)
     # ============================================================
     indices = list(range(len(dataset)))
     random.seed(42)  # For reproducibility
     random.shuffle(indices)
-
-    total_len = len(indices)
-    train_end = int(0.4 * total_len)
-    refiner_end = int(0.8 * total_len)
-    dev_end = int(0.9 * total_len)
+    
+    train_end = int(0.8 * len(indices))
+    dev_end = int(0.9 * len(indices))
 
     train_indices = indices[:train_end]
-    refiner_indices = indices[train_end:refiner_end]
-    dev_indices = indices[refiner_end:dev_end]
+    dev_indices = indices[train_end:dev_end]
     test_indices = indices[dev_end:]
 
-    print(f"Total samples: {total_len}")
-    print(f"Train: {len(train_indices)} | Refiner: {len(refiner_indices)} | "
+    print(f"Total samples: {len(dataset)}")
+    print(f"Train: {len(train_indices)} | "
         f"Dev: {len(dev_indices)} | Test: {len(test_indices)}")
 
     # Create subsets
     train_dataset = Subset(dataset, train_indices)
-    refiner_dataset = Subset(dataset, refiner_indices)
     dev_dataset = Subset(dataset, dev_indices)
     test_dataset = Subset(dataset, test_indices)
 
@@ -81,14 +78,8 @@ if __name__ == "__main__":
     # Data loaders
     # ------------------------------------------------------------
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=False)
-    refiner_loader = DataLoader(refiner_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
     dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-
-    # Deterministic loaders for generating coarse masks (no shuffle)
-    train_loader_for_masks = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-    refiner_loader_for_masks = DataLoader(refiner_dataset, batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False)
-
 
     # Model checkpoint path
     model_checkpoint_path = "checkpoints/baseline_unet.pth"
@@ -162,7 +153,8 @@ if __name__ == "__main__":
                 
                 # Generate coarse masks
                 coarse_masks_logits = baseline_model(images)  # (B, 1, H, W) raw logits
-                coarse_masks = torch.sigmoid(coarse_masks_logits)  # (B, 1, H, W) probabilities in [0, 1]
+                thresholded_masks = (torch.sigmoid(coarse_masks_logits) > 0.5).float()
+                coarse_masks = (thresholded_masks - 0.5) * 2 # [-1, 1]
 
                 # Iterate over each item in the batch
                 for i in range(images.shape[0]):
@@ -186,12 +178,12 @@ if __name__ == "__main__":
     dataset_dir = "data/oxcoarse"
     
     # Generate masks for training set (model was NOT trained on this)
-    print("\nGenerating masks for REFINEMENT training set...")
-    train_count = generate_and_save_masks(refiner_loader, dataset_dir, "train")
+    print("\nGenerating masks for training set...")
+    train_count = generate_and_save_masks(train_loader, dataset_dir, "train")
     print(f"Saved {train_count} training samples")
     
     # Generate masks for DEV set (model was NOT trained on this)
-    print("\nGenerating masks for DEV set...")
+    print("\nGenerating masks for dev set...")
     dev_count = generate_and_save_masks(dev_loader, dataset_dir, "val")
     print(f"Saved {dev_count} validation samples")
     
