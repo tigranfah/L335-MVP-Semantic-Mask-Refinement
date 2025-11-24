@@ -75,17 +75,13 @@ class CoarseOxfordIIITPet(Dataset):
         return image, coarse_mask, gt_mask
 
 
-def dynamic_augment_collate_fn(batch_data, image_transforms):
-    # set random seed to obtain random augmentations
-    # np.random.seed(time.time())
-
+def augment_batch(batch_data, image_transforms):
     augmented_images = []
     augmented_coarse_masks = []
     augmented_gt_masks = []
 
-    for batch in batch_data:
-        image, coarse_mask, gt_mask = batch
-
+    images, coarse_masks, gt_masks = batch_data
+    for image, coarse_mask, gt_mask in zip(images, coarse_masks, gt_masks, strict=True):
         # image: [C, H, W] float -> [H, W, C] float
         image = image.permute(1, 2, 0).cpu().numpy()
         # masks: [H, W] long -> [H, W] long
@@ -111,15 +107,11 @@ def dynamic_augment_collate_fn(batch_data, image_transforms):
     return torch.stack(augmented_images), torch.stack(augmented_coarse_masks), torch.stack(augmented_gt_masks)
 
 
-def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):    
-    # Transforms for the RGB image
-    img_transforms = A.Compose([
-        A.Resize(height=image_size, width=image_size),
-        A.Rotate(limit=15, p=0.5, fill=-1, fill_mask=-1),
-        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=-1, fill_mask=-1),
-        A.HorizontalFlip(p=0.5),
-    ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
+# def augment_batch(batch_data, image_transforms):
+#     return batch_data
 
+
+def get_train_val_dataloaders(batch_size, root_dir):
     train_dataset = CoarseOxfordIIITPet(
         os.path.join(root_dir, "train")
     )
@@ -138,24 +130,21 @@ def get_train_val_dataloaders(image_size, batch_size, root_dir, val_split=0.2):
         batch_size=batch_size,
         shuffle=True,
         num_workers=2,
-        drop_last=True,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        drop_last=True
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=2,
-        drop_last=False,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        drop_last=False
     )
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=test_size,
         shuffle=False,
         num_workers=2,
-        drop_last=False,
-        collate_fn=lambda x: dynamic_augment_collate_fn(x, img_transforms)
+        drop_last=False
     )
     
     return train_dataloader, val_dataloader, test_dataloader
@@ -165,6 +154,7 @@ def sample_and_save_images(
     model,
     noise_scheduler,
     test_dataloader,
+    image_transforms,
     device,
     epoch,
     output_dir,
@@ -176,7 +166,7 @@ def sample_and_save_images(
     # Get a batch of test data
     try:
         batch = next(iter(test_dataloader))
-        clean_images, coarse_mask, gt_mask = batch
+        clean_images, coarse_mask, gt_mask = augment_batch(batch, image_transforms)
         clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
     except Exception as e:
         print(f"Error getting test batch: {e}")
@@ -254,7 +244,7 @@ def sample_and_save_images(
     model.train()
 
 
-def validate(model, noise_scheduler, val_dataloader, device):
+def validate(model, noise_scheduler, val_dataloader, image_transforms, device):
     """Validates the model on the validation set."""
     model.eval()
     total_loss = 0.0
@@ -262,7 +252,7 @@ def validate(model, noise_scheduler, val_dataloader, device):
     
     with torch.no_grad():
         for batch in tqdm(val_dataloader, desc="Validating"):
-            clean_images, coarse_mask, gt_mask = batch
+            clean_images, coarse_mask, gt_mask = augment_batch(batch, image_transforms)
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
@@ -312,11 +302,17 @@ def train_model(args):
     # --- 2. Load and Preprocess Dataset ---
     print("Loading dataset...")
     train_dataloader, val_dataloader, test_dataloader_for_sampling = get_train_val_dataloaders(
-        args.image_size,
         args.batch_size,
-        os.path.join(args.data_root_dir, "oxcoarse"),
-        val_split=args.val_split
+        os.path.join(args.data_root_dir, "oxcoarse")
     )
+
+    # Transforms for the RGB image
+    image_transforms = A.Compose([
+        A.Resize(height=args.image_size, width=args.image_size),
+        A.Rotate(limit=15, p=0.5, fill=-1, fill_mask=-1),
+        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=-1, fill_mask=-1),
+        A.HorizontalFlip(p=0.5),
+    ], additional_targets={"coarse_mask": "mask", "gt_mask": "mask"})
 
     # --- 3. Define the Model, Scheduler, and Optimizer ---
     print("Initializing model...")
@@ -372,7 +368,10 @@ def train_model(args):
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}")
         
         for step, batch in enumerate(train_dataloader):
-            clean_images, coarse_mask, gt_mask = batch
+            clean_images, coarse_mask, gt_mask = augment_batch(batch, image_transforms)
+            if args.perturb_coarse_mask:
+                flip_mask = torch.rand_like(coarse_mask) <= 0.05
+                coarse_mask[flip_mask] = 1 - coarse_mask[flip_mask]
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
@@ -422,7 +421,7 @@ def train_model(args):
         
         # --- 5. Validation at end of epoch ---
         print(f"Running validation for epoch {epoch+1}...")
-        val_loss = validate(model, noise_scheduler, val_dataloader, device)
+        val_loss = validate(model, noise_scheduler, val_dataloader, image_transforms, device)
         print(f"Validation loss: {val_loss:.4f}")
         
         # Log validation metrics to wandb
@@ -437,6 +436,7 @@ def train_model(args):
                 model, 
                 noise_scheduler, 
                 test_dataloader_for_sampling, 
+                image_transforms,
                 device, 
                 epoch, 
                 args.output_dir,
@@ -458,14 +458,14 @@ def train_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--image_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--num_epochs", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
+    parser.add_argument("--perturb_coarse_mask", action="store_true")
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
-    parser.add_argument("--val_split", type=float, default=0.1)
     args = parser.parse_args()
     train_model(args)
