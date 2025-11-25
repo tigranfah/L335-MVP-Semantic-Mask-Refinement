@@ -164,26 +164,26 @@ class MaskAutoencoder(nn.Module):
 
 # # Test the model
 # if __name__ == "__main__":
-#     # Test with 256x256 masks
-#     model = MaskAutoencoder(base_channel_size=32, latent_dim=128)
+    # # Test with 256x256 masks
+    # model = MaskAutoencoder(base_channel_size=32, latent_dim=128)
     
-#     # Create dummy input
-#     x = torch.randn(4, 1, 256, 256)  # Batch of 4 masks
+    # # Create dummy input
+    # x = torch.randn(4, 1, 256, 256)  # Batch of 4 masks
     
-#     print("Input shape:", x.shape)
+    # print("Input shape:", x.shape)
     
-#     # Forward pass
-#     logits = model(x)
-#     print("Output shape:", logits.shape)
+    # # Forward pass
+    # logits = model(x)
+    # print("Output shape:", logits.shape)
     
-#     # Encode
-#     z = model.encode(x)
-#     print("Latent shape:", z.shape)
+    # # Encode
+    # z = model.encode(x)
+    # print("Latent shape:", z.shape)
     
-#     # Reconstruct
-#     recon = model.reconstruct(x)
-#     print("Reconstruction shape:", recon.shape)
+    # # Reconstruct
+    # recon = model.reconstruct(x)
+    # print("Reconstruction shape:", recon.shape)
     
-#     # Count parameters
-#     total_params = sum(p.numel() for p in model.parameters())
-#     print(f"Total parameters: {total_params:,}")
+    # # Count parameters
+    # total_params = sum(p.numel() for p in model.parameters())
+    # print(f"Total parameters: {total_params:,}")
