@@ -10,7 +10,7 @@ def train_baseline(
     model,
     train_loader,
     device,
-    model_path="checkpoints/baseline_unet.pth",
+    model_path="checkpoints/baseline_unet_coco.pth",
     num_epochs=100,
     lr=1e-4,
 ):
@@ -24,7 +24,7 @@ def train_baseline(
 
     print("Training new baseline model...")
     model.train()
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(num_epochs):

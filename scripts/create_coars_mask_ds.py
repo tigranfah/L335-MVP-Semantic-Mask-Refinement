@@ -15,7 +15,6 @@ import random
 #ugly import of model, could be made a package
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 from model.baseline_unet import UNetSmall
 
 if __name__ == "__main__":
