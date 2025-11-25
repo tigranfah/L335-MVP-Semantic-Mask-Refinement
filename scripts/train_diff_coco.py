@@ -71,9 +71,9 @@ def get_train_val_dataloaders(image_size, batch_size):
     # Transforms for the RGB image
     img_transforms = A.Compose([
         A.Resize(height=image_size, width=image_size),
-        A.Rotate(limit=15, p=0.5, fill=0, fill_mask=-1),
-        A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=0, fill_mask=-1),
-        A.HorizontalFlip(p=0.5),
+        # A.Rotate(limit=15, p=0.5, fill=0, fill_mask=-1),
+        # A.Affine(translate_percent=(0.1, 0.1), p=0.5, fill=0, fill_mask=-1),
+        # A.HorizontalFlip(p=0.5),
     ], additional_targets={"gt_mask": "mask", "coarse_mask": "mask"})
 
     train_dataset = COCOSegmentationDataset(
