@@ -120,7 +120,7 @@ def get_train_val_dataloaders(batch_size, root_dir):
     )
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
-    test_size = 16
+    test_size = 64
 
     test_dataset = Subset(val_dataset, list(range(len(val_dataset)))[:test_size])
     
@@ -369,8 +369,9 @@ def train_model(args):
         
         for step, batch in enumerate(train_dataloader):
             clean_images, coarse_mask, gt_mask = augment_batch(batch, image_transforms)
-            if args.perturb_coarse_mask:
-                flip_mask = torch.rand_like(coarse_mask) <= 0.05
+            if args.perturb_percentage:
+                perturn_perc = torch.rand(1).item() * args.perturb_percentage
+                flip_mask = torch.rand_like(coarse_mask) <= perturn_perc
                 coarse_mask[flip_mask] = 1 - coarse_mask[flip_mask]
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
@@ -464,7 +465,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
-    parser.add_argument("--perturb_coarse_mask", action="store_true")
+    parser.add_argument("--perturb_percentage", type=float, default=0.1)
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
     args = parser.parse_args()
