@@ -34,6 +34,7 @@ class COCOSegmentationDataset(Dataset):
         transforms: Optional[Callable[[Image.Image, Image.Image], Tuple[Image.Image, Image.Image]]] = None,
         keep_crowd: bool = False,
         skip_images_without_annotations: bool = True,
+        coarse_mask_dir="..."
     ):
         """
         coco_json_path: path to instances_train*.json
@@ -47,6 +48,8 @@ class COCOSegmentationDataset(Dataset):
         self.images_root = Path(images_root)
         self.transforms = transforms
         self.keep_crowd = keep_crowd
+
+        self.coarse_mask_dir = coarse_mask_dir
 
         with open(coco_json_path, "r") as f:
             coco = json.load(f)
@@ -185,8 +188,11 @@ class COCOSegmentationDataset(Dataset):
         # mask: convert to LongTensor HxW
         mask_arr = np.array(mask, dtype=np.int64)
         mask_tensor = torch.from_numpy(mask_arr).long()
+        # coarse_mask = torch.load(os.path.join(self.coarse_mask_dir, file_name))
+        coarse_mask = mask_tensor
 
-        return image_tensor, mask_tensor, mask_tensor
+
+        return image_tensor, coarse_mask, mask_tensor
 
 
 if __name__ == "__main__":

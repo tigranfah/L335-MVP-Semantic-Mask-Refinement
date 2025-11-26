@@ -196,7 +196,7 @@ def train_model(args):
     args.output_dir = os.path.join(args.output_dir, exp_id)
     # --- 1. Initialize wandb ---
     wandb.init(
-        project="diffusion-segmentation",
+        project="combined",
         config=vars(args),
         name=exp_id,
         entity="tf426-cam"
@@ -249,7 +249,7 @@ def train_model(args):
     model = UNet2DModel(
         sample_size=args.image_size,
         in_channels=12 if args.latent else 5,
-        out_channels=1,
+        out_channels=4 if args.latent else 1,
         layers_per_block=1,
         block_out_channels=(32, 64, 128), # Halve the channels
         down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D"), # No attention
