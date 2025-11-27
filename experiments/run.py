@@ -22,7 +22,7 @@ import glob
 from model.mask_autoencoder import MaskAutoencoder
 # import time
 
-from scripts.data_utils import CoarseOxfordIIITPet, augment_batch, oxford_get_train_val_dataloaders, generate_random_id, coco_get_train_val_dataloaders
+from scripts.data_utils import CoarseOxfordIIITPet, augment_batch, oxford_get_train_val_dataloaders, generate_random_id, coco_get_train_val_dataloaders, block_image
 
 def sample_and_save_images(
     model,
@@ -295,6 +295,8 @@ def train_model(args):
             if args.perturb_coarse_mask:
                 flip_mask = torch.rand_like(coarse_mask) <= args.perturb_p
                 coarse_mask[flip_mask] = 1 - coarse_mask[flip_mask]
+            elif args.block_coarse_mask:
+                coarse_mask = block_image(coarse_mask, args.n_blobs, args.blob_radius,device)
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
             batch_size = clean_images.shape[0]
@@ -401,5 +403,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_root_dir", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default="oxford")
     parser.add_argument("--latent", action="store_true")
+    parser.add_argument("--block_coarse_mask", action="store_true")
+    parser.add_argument("--n_blobs", type=float, default=10)
+    parser.add_argument("--blob_radius", type=float, default=10)
     args = parser.parse_args()
     train_model(args)

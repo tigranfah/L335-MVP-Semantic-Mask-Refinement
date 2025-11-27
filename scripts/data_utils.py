@@ -11,6 +11,44 @@ import albumentations as A
 
 from scripts.coco_dataset import COCOSegmentationDataset
 
+
+def random_blob_image(
+    height=256,
+    width=256,
+    num_blobs=10,
+    blob_radius=10,
+    device="cpu"
+):
+    # Base empty image
+    img = torch.zeros((1, 1, height, width), device=device)
+
+    for _ in range(num_blobs):
+        # Random center
+        cx = torch.randint(0, width, (1,))
+        cy = torch.randint(0, height, (1,))
+        
+        # Random amplitude for blob
+        amp = torch.rand(1).item() * 1.0
+        
+        # Create a 2D Gaussian kernel
+        y = torch.arange(height, device=device).view(-1, 1)
+        x = torch.arange(width, device=device).view(1, -1)
+
+        blob = torch.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * blob_radius ** 2))
+        blob = blob * amp
+        
+        img += blob
+
+    # Normalize to [0,1]
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+    return (img.squeeze() >= 0.5)  # shape: (H, W)
+
+def block_image(img, num_blobs, blob_radius, device):
+    blob = random_blob_image(img.shape[1], img.shape[2], num_blobs=num_blobs, blob_radius=blob_radius).to(device)
+    blob_img = blob.logical_not().unsqueeze(0) * img.to(device)
+    return blob_img
+
 # def get_loaders(image_size=256, batch_size=32, data_split=(0.8, 0.1, 0.1), num_workers=2, root="./data",):
 #     """
 #     Creates and returns DataLoaders for the Oxford-IIIT Pet dataset.
