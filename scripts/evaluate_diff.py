@@ -96,8 +96,8 @@ def evaluate_model(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--num_train_timesteps", type=int, default=1000)
     parser.add_argument("--data_root_dir", type=str, required=True)
+    parser.add_argument("--num_train_timesteps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--image_size", type=int, default=128)
     args = parser.parse_args()

@@ -19,7 +19,6 @@ import random
 import string
 import argparse
 import glob
-# import time
 
 
 def generate_random_id(length=6):
@@ -86,6 +85,12 @@ def augment_batch(batch_data, image_transforms):
         image = image.permute(1, 2, 0).cpu().numpy()
         # masks: [H, W] long -> [H, W] long
         coarse_mask = coarse_mask.cpu().numpy().squeeze(0)
+
+        # if coarse mask contains probabilities, assign 1 considering the probability
+        random_probs = np.random.uniform(0, 1, size=coarse_mask.shape)
+        coarse_mask[random_probs <= coarse_mask] = 1
+        coarse_mask[random_probs > coarse_mask] = -1
+
         gt_mask = gt_mask.cpu().numpy().squeeze(0)
         
         transformed = image_transforms(image=image, coarse_mask=coarse_mask, gt_mask=gt_mask)
@@ -303,7 +308,7 @@ def train_model(args):
     print("Loading dataset...")
     train_dataloader, val_dataloader, test_dataloader_for_sampling = get_train_val_dataloaders(
         args.batch_size,
-        os.path.join(args.data_root_dir, "oxcoarse")
+        os.path.join(args.data_root_dir, args.dataset_dir)
     )
 
     # Transforms for the RGB image
@@ -465,7 +470,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
-    parser.add_argument("--perturb_percentage", type=float, default=0.1)
+    parser.add_argument("--dataset_dir", type=str, default="oxcoarse_v2")
+    parser.add_argument("--perturb_percentage", type=float, default=None)
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
     args = parser.parse_args()
