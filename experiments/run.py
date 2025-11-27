@@ -293,7 +293,7 @@ def train_model(args):
         for step, batch in enumerate(train_dataloader):
             clean_images, coarse_mask, gt_mask = augment_batch(batch, image_transforms)
             if args.perturb_coarse_mask:
-                flip_mask = torch.rand_like(coarse_mask) <= 0.05
+                flip_mask = torch.rand_like(coarse_mask) <= args.perturb_p
                 coarse_mask[flip_mask] = 1 - coarse_mask[flip_mask]
             clean_images, coarse_mask, gt_mask = clean_images.to(device), coarse_mask.to(device), gt_mask.to(device)
             
@@ -396,10 +396,10 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--num_train_timesteps", type=int, default=1000)
     parser.add_argument("--perturb_coarse_mask", action="store_true")
+    parser.add_argument("--perturb_p", type=float, default=0.05)
     parser.add_argument("--output_dir", type=str, default="../test_segmentations")
     parser.add_argument("--data_root_dir", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default="oxford")
     parser.add_argument("--latent", action="store_true")
-    
     args = parser.parse_args()
     train_model(args)
