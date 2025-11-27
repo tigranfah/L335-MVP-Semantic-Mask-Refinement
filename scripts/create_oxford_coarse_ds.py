@@ -18,8 +18,7 @@ def generate_and_save_masks(baseline_model, dataloader, dataset_dir, split_name,
     """Generate and save coarse masks for a given split (train or val)"""
     os.makedirs(os.path.join(dataset_dir, split_name, "images"), exist_ok=True)
     os.makedirs(os.path.join(dataset_dir, split_name, "gt_masks"), exist_ok=True)
-    if baseline_model:
-        os.makedirs(os.path.join(dataset_dir, split_name, "coarse_masks"), exist_ok=True)
+    os.makedirs(os.path.join(dataset_dir, split_name, "coarse_masks"), exist_ok=True)
     
     sample_index = 0
     with torch.no_grad():
@@ -30,11 +29,14 @@ def generate_and_save_masks(baseline_model, dataloader, dataset_dir, split_name,
             if baseline_model:
                 coarse_masks_logits = baseline_model(images)  # (B, 1, H, W) raw logits
                 coarse_masks = (torch.sigmoid(coarse_masks_logits) - 0.5) * 2 # [-1, 1]
+            else:
+                coarse_masks = torch.zeros_like(gt_masks)
 
             # Iterate over each item in the batch
             for i in range(images.shape[0]):
                 # Get the individual tensor for this sample
                 img_tensor = images[i].cpu()  # (3, H, W)
+                coarse_mask_tensor = coarse_masks[i].cpu()  # (1, H, W)
                 gt_mask_tensor = gt_masks[i].cpu()  # (1, H, W)
                 
                 # Define the output file path using a zero-padded index
@@ -43,10 +45,7 @@ def generate_and_save_masks(baseline_model, dataloader, dataset_dir, split_name,
                 # Save each tensor individually
                 torch.save(img_tensor, os.path.join(dataset_dir, split_name, "images", file_name))
                 torch.save(gt_mask_tensor, os.path.join(dataset_dir, split_name, "gt_masks", file_name))
-
-                if args.checkpoint_path is not None:
-                    coarse_mask_tensor = coarse_masks[i].cpu()  # (1, H, W)
-                    torch.save(coarse_mask_tensor, os.path.join(dataset_dir, split_name, "coarse_masks", file_name))
+                torch.save(coarse_mask_tensor, os.path.join(dataset_dir, split_name, "coarse_masks", file_name))
                 
                 sample_index += 1
     
