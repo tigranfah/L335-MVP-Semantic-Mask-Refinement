@@ -16,6 +16,7 @@ import albumentations as A
 from diffusers.optimization import get_scheduler
 
 
+# from coco_viz import visualize_batch, visualize_predictions, print_batch_statistics
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -78,7 +79,7 @@ def get_train_val_dataloaders(image_size, batch_size):
     
     return train_dataloader, val_dataloader, test_dataloader
 
-def validate(model, val_dataloader, device):
+def validate(model, val_dataloader, device, current_epoch, log_images=False):
     """Validates the model on the validation set."""
     jaccard_index = JaccardIndex(task="binary", threshold=0.5).to(device) #pass as arg
     psnr_metric = PeakSignalNoiseRatio().to(device)
@@ -91,22 +92,26 @@ def validate(model, val_dataloader, device):
     total_psnr = 0.0
 
     criterion = nn.BCEWithLogitsLoss()
+    class_labels = {0: "background", 1: "car"}
 
     
     with torch.no_grad():
-        for batch in tqdm(val_dataloader, desc="Validating"):
+        for i, batch in enumerate(tqdm(val_dataloader, desc="Validating")):
+        # for batch in tqdm(val_dataloader, desc="Validating"):
             clean_images, _, gt_mask = batch
             clean_images, gt_mask = clean_images.to(device), gt_mask.to(device)
             
-            outputs = model(clean_images)          
-            loss = criterion(outputs, gt_mask)
+            outputs_logits = model(clean_images)          
+            loss = criterion(outputs_logits, gt_mask)
+
+            outputs_probs = torch.sigmoid(outputs_logits)
 
             iou_score = jaccard_index(
-                outputs, 
+                outputs_probs, 
                 gt_mask
             )
             psnr = psnr_metric(
-                outputs, 
+                outputs_probs, 
                 gt_mask
             )
             
@@ -115,6 +120,58 @@ def validate(model, val_dataloader, device):
             total_psnr += psnr
 
             num_batches += 1
+
+            # 4. Visualization Logic (Only for the first batch, if flag is set)
+            if log_images and i == 0:
+                viz_images = []
+                # Limit to first 8 images
+                num_samples = min(clean_images.shape[0], 8)
+                
+                # --- COLOR MAPPING STRATEGY ---
+                # We define 3 classes so WandB assigns distinct colors:
+                # 0: Background (Transparent)
+                # 1: Ground Truth (Usually Red in WandB default)
+                # 2: Prediction (Usually distinct, e.g., Blue/Purple/Cyan)
+                viz_labels = {
+                    0: "background", 
+                    1: "ground_truth", 
+                    2: "prediction"
+                }
+                
+                for idx in range(num_samples):
+                    # Prepare Image: (C,H,W) -> (H,W,C)
+                    img_np = clean_images[idx].cpu().permute(1, 2, 0).numpy()
+                    
+                    # Prepare Ground Truth: Class 1
+                    # Ensure it is integer type (uint8)
+                    gt_np = gt_mask[idx].cpu().squeeze().numpy().astype(np.uint8)
+                    
+                    # Prepare Prediction: Class 2
+                    # 1. Threshold to get binary (0 or 1)
+                    # 2. Multiply by 2 so the valid pixels become Class ID 2
+                    pred_raw = (outputs_probs[idx] > 0.5).float().cpu().squeeze().numpy()
+                    pred_np = (pred_raw * 2).astype(np.uint8) 
+
+                    # Create WandB Image
+                    # We use the SAME dictionary 'viz_labels' for both, 
+                    # but the data arrays contain different integers (1 vs 2).
+                    viz_images.append(wandb.Image(
+                        img_np,
+                        masks={
+                            "ground_truth": {
+                                "mask_data": gt_np,
+                                "class_labels": viz_labels
+                            },
+                            "predictions": {
+                                "mask_data": pred_np,
+                                "class_labels": viz_labels
+                            }
+                        },
+                        caption=f"Epoch {current_epoch} | Sample {idx}"
+                    ))
+                
+                # Log the list
+                wandb.log({"val_samples": viz_images, "val/epoch": current_epoch})
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_iou = total_iou / num_batches if num_batches > 0 else 0.0
@@ -138,6 +195,7 @@ def train_baseline(
         args.batch_size,
     )
 
+
     exp_id = generate_random_id()
     wandb.init(
         project="baseline-segmentation-coco",
@@ -145,6 +203,7 @@ def train_baseline(
         name=exp_id,
         entity="tf426-cam"
     )
+    wandb_id = wandb.run.id
 
     base_path, ext = os.path.splitext(args.output_dir)
     output_dir_with_id = f"{base_path}_{wandb.run.id}{ext}"
@@ -160,8 +219,8 @@ def train_baseline(
     model.train()
     criterion = criterion = nn.BCEWithLogitsLoss() #with CE -0.0
     lr=args.learning_rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr)#, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params:,}")
@@ -202,8 +261,18 @@ def train_baseline(
                 "train/epoch": epoch,
                 "train/global_step": global_step
             })
+        
+        should_log_images = (epoch % args.viz_interval == 0)
 
-        val_loss, val_iou, val_psnr = validate(model, val_dataloader, device)
+        val_loss, val_iou, val_psnr = validate(
+            model, 
+            val_dataloader, 
+            device, 
+            current_epoch=epoch, 
+            log_images=should_log_images
+        )
+
+        # val_loss, val_iou, val_psnr = validate(model, val_dataloader, device)
         print(f"Validation loss: {val_loss:.4f}")
 
         wandb.log({
@@ -213,10 +282,12 @@ def train_baseline(
             "val/epoch": epoch
         })
 
-
-    torch.save(model.state_dict(), output_dir_with_id)
-    print(f"Final model saved to {output_dir_with_id}")
-    
+        if should_log_images:
+            filename = f"baseline_coco_{epoch}_{wandb_id}.pth"
+            save_path = os.path.join(args.output_dir, filename)
+        
+            torch.save(model.state_dict(), save_path)
+            print(f"Checkpoint saved to {save_path}")
 
 
 if __name__ == "__main__":
@@ -233,9 +304,10 @@ if __name__ == "__main__":
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps for LR scheduler")
-    parser.add_argument("--output_dir", type=str, default="checkpoints/baseline_unet_coco.pth")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/")
+    parser.add_argument("--viz_interval", type=int, default=10, help="Visualize every N epochs")
     args = parser.parse_args()
 
     # Train or load model

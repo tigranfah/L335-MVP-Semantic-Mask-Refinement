@@ -1,75 +1,180 @@
+import argparse
 import os
 import torch
 import torch.nn as nn
+from torchmetrics import JaccardIndex, PeakSignalNoiseRatio
 from tqdm.auto import tqdm
-from model.baseline_unet import UNetSmall
-from scripts.data_utils import get_loaders
+import wandb
+from data_utils import generate_random_id
+from train_baseline_coco import set_seed
+from train_diff import get_train_val_dataloaders
+from baseline_unet import UNetSmall
+from diffusers.optimization import get_scheduler
 
+
+
+def validate(model, val_dataloader, device):
+    """Validates the model on the validation set."""
+    jaccard_index = JaccardIndex(task="binary", threshold=0.5).to(device) #pass as arg
+    psnr_metric = PeakSignalNoiseRatio().to(device)
+
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    total_iou = 0.0
+    total_psnr = 0.0
+
+    criterion = nn.BCEWithLogitsLoss()
+    class_labels = {0: "background", 1: "pet"}
+
+    
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_dataloader, desc="Validating")):
+        # for batch in tqdm(val_dataloader, desc="Validating"):
+            clean_images, _, gt_mask = batch
+            clean_images, gt_mask = clean_images.to(device), gt_mask.to(device)
+            
+            outputs_logits = model(clean_images)    
+            targets = (gt_mask + 1) / 2  # [-1,1] → [0,1]
+      
+            loss = criterion(outputs_logits, targets)
+
+            outputs_probs = torch.sigmoid(outputs_logits)
+
+            iou_score = jaccard_index(
+                outputs_probs, 
+                targets
+            )
+            psnr = psnr_metric(
+                outputs_probs, 
+                targets
+            )
+            
+            total_loss += loss.item()
+            total_iou += iou_score
+            total_psnr += psnr
+
+            num_batches += 1
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_iou = total_iou / num_batches if num_batches > 0 else 0.0
+    avg_psnr = total_psnr / num_batches if num_batches > 0 else 0.0
+    model.train()
+    return avg_loss, avg_iou, avg_psnr
 
 def train_baseline(
     model,
-    train_loader,
-    device,
-    model_path="checkpoints/baseline_unet_coco.pth",
-    num_epochs=100,
-    lr=1e-4,
+    args
 ):
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    train_loader, val_dataloader, test_dataloader_for_sampling = get_train_val_dataloaders(
+        args.batch_size,
+        args.data_root_dir
+    )
 
-    if os.path.exists(model_path):
-        print(f"Loading pretrained model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print("Model loaded successfully!")
-        return model
 
+    
     print("Training new baseline model...")
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    set_seed(42)
+    exp_id = generate_random_id()
 
-    for epoch in range(num_epochs):
+    os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+
+    wandb.init(
+        project="baseline-segmentation-oxford",
+        config=vars(args),
+        name=exp_id,
+        entity="tf426-cam"
+    )
+    wandb_id = wandb.run.id
+
+    
+
+    model.train()
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    lr_scheduler = get_scheduler(
+        "cosine",
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=(len(train_loader) * args.num_epochs),
+    )
+
+    for epoch in range(args.num_epochs):
         model.train()
         epoch_loss = 0.0
-        for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        for step, batch in enumerate(tqdm(train_loader)):
+            images, _, masks = batch
             images, masks = images.to(device), masks.to(device)
 
             optimizer.zero_grad()
             outputs = model(images)
 
-            # print(f"\n[DEBUG] Epoch {epoch+1}: Unique values in raw masks:", torch.unique(masks))
             targets = (masks + 1) / 2  # [-1,1] → [0,1]
-            # print(f"[DEBUG] Epoch {epoch+1}: Unique values in normalized targets:", torch.unique(targets))
-            # [DEBUG] Epoch 1: Unique values in raw masks: tensor([-1.,  1.], device='cuda:0')         
-            # [DEBUG] Epoch 1: Unique values in normalized targets: tensor([0., 1.], device='cuda:0')  
-            # Epoch 1/100:   2%|▊                                       | 1/46 [00:01<01:24,  1.89s/it]
-            # [DEBUG] Epoch 1: Unique values in raw masks: tensor([-1.,  1.], device='cuda:0')         
-            # [DEBUG] Epoch 1: Unique values in normalized targets: tensor([0., 1.], device='cuda:0')
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+            lr_scheduler.step()
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.4f}")
+            global_step = epoch * len(train_loader) + step
+            current_lr = lr_scheduler.get_last_lr()[0]  # Get the actual current LR
 
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/learning_rate": current_lr,
+                "train/epoch": epoch,
+                "train/global_step": global_step
+            })
+
+        val_loss, val_iou, val_psnr = validate(
+            model,
+            val_dataloader,
+            device,
+        )
+
+        should_log_images = (epoch % args.viz_interval == 0)
+        print(f"Validation loss: {val_loss:.4f}")
+
+        wandb.log({
+            "val/loss": val_loss,
+            "val/iou": val_iou,
+            "val/psnr": val_psnr,
+            "val/epoch": epoch
+        })
+
+        if should_log_images:
+            filename = f"baseline_oxpets_{epoch}_{wandb_id}.pth"
+            save_path = os.path.join(args.output_dir, filename)
+        
+            torch.save(model.state_dict(), save_path)
+            print(f"Checkpoint saved to {save_path}")
+
     return model
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--image_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--warmup_steps", type=int, default=500, help="Number of warmup steps for LR scheduler")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/")
+    parser.add_argument("--viz_interval", type=int, default=10, help="Visualize every N epochs")
+    parser.add_argument("--data_root_dir", type=str, default="data/oxford", help="data path")
+
+    args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    image_size = 256
-    batch_size = 32
-    model_path = "checkpoints/baseline_unet.pth"
+
+
     BASELINE_OUTPUT_CHANNELS = 1    
-
-    # Get dataloaders
-    loaders = get_loaders(image_size=image_size, batch_size=batch_size)
-    train_loader = loaders["train"]
-
+    
     # Build model
     model = UNetSmall(in_ch=3, out_ch=BASELINE_OUTPUT_CHANNELS).to(device)
 
     # Train or load model
-    train_baseline(model, train_loader, device, model_path)
+    train_baseline(
+    model,
+    args)
